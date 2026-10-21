@@ -1,3 +1,8 @@
+10.0.0
+------
+
+* Added streaming RPC support: `RPC.call_stream()` asynchronously iterates zero or more results produced by a registered async generator; remote errors propagate to the iterator, breaking the iteration cancels the remote producer, and dropped connections unblock both sides instead of hanging. Plain `RPC.call()` behavior is unchanged.
+
 9.6.0
 -----
 

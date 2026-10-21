@@ -9,7 +9,7 @@ import aio_pika
 from aio_pika import Message
 from aio_pika.exceptions import MessageProcessError
 from aio_pika.message import IncomingMessage
-from aio_pika.patterns.rpc import RPC
+from aio_pika.patterns.rpc import JsonRPC, JsonRPCError, RPC
 from aio_pika.patterns.rpc import log as rpc_logger
 from tests import get_random_name
 
@@ -26,6 +26,24 @@ async def rpc_func2(*, foo, bar):
     assert not bar
 
     return {"foo": "bar2"}
+
+
+async def rpc_stream_range(*, count, delay=0):
+    for i in range(count):
+        yield i
+        if delay:
+            await asyncio.sleep(delay)
+
+
+async def rpc_stream_empty():
+    if False:  # pragma: no cover
+        yield 0
+
+
+async def rpc_stream_error(*, after):
+    for i in range(after):
+        yield i
+    raise RuntimeError("stream boom")
 
 
 class TestCase:
@@ -286,3 +304,346 @@ class TestCase:
 
         await rpc_default.unregister(rpc_func)
         await rpc_default.close()
+
+    async def test_stream_simple(self, channel: aio_pika.Channel):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        method_name = get_random_name("test", "stream")
+        await rpc.register(
+            method_name, rpc_stream_range, auto_delete=True,
+        )
+
+        result = [
+            item
+            async for item in rpc.call_stream(method_name, {"count": 5})
+        ]
+        assert result == [0, 1, 2, 3, 4]
+
+        await rpc.unregister(rpc_stream_range)
+        await rpc.close()
+
+    async def test_stream_empty(self, channel: aio_pika.Channel):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        method_name = get_random_name("test", "stream-empty")
+        await rpc.register(
+            method_name, rpc_stream_empty, auto_delete=True,
+        )
+
+        result = [item async for item in rpc.call_stream(method_name)]
+        assert result == []
+
+        await rpc.unregister(rpc_stream_empty)
+        await rpc.close()
+
+    async def test_stream_plain_value(self, channel: aio_pika.Channel):
+        # A regular coroutine function called via call_stream must deliver
+        # exactly one item and then end.
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        await rpc.register("test.rpc", rpc_func, auto_delete=True)
+
+        result = [
+            item
+            async for item in rpc.call_stream(
+                "test.rpc", {"foo": None, "bar": None},
+            )
+        ]
+        assert result == [{"foo": "bar"}]
+
+        await rpc.unregister(rpc_func)
+        await rpc.close()
+
+    async def test_stream_error(self, channel: aio_pika.Channel):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        method_name = get_random_name("test", "stream-error")
+        await rpc.register(
+            method_name, rpc_stream_error, auto_delete=True,
+        )
+
+        stream = rpc.call_stream(method_name, {"after": 2})
+
+        assert await stream.__anext__() == 0
+        assert await stream.__anext__() == 1
+
+        with pytest.raises(RuntimeError, match="stream boom"):
+            await stream.__anext__()
+
+        await stream.aclose()
+
+        await rpc.unregister(rpc_stream_error)
+        await rpc.close()
+
+    async def test_stream_concurrent(self, channel: aio_pika.Channel):
+        # Concurrent streams of the same method must not mix.
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        method_name = get_random_name("test", "stream-concurrent")
+        await rpc.register(
+            method_name, rpc_stream_range, auto_delete=True,
+        )
+
+        async def collect():
+            return [
+                item
+                async for item in rpc.call_stream(
+                    method_name, {"count": 4, "delay": 0.02},
+                )
+            ]
+
+        results = await asyncio.gather(*(collect() for _ in range(6)))
+        assert results == [[0, 1, 2, 3] for _ in range(6)]
+
+        await rpc.unregister(rpc_stream_range)
+        await rpc.close()
+
+    async def test_stream_client_cancel(self, channel: aio_pika.Channel):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        produced = []
+        stopped = asyncio.Event()
+
+        async def rpc_stream_long(*, delay):
+            try:
+                for i in range(1000):
+                    produced.append(i)
+                    yield i
+                    await asyncio.sleep(delay)
+            finally:
+                stopped.set()
+
+        method_name = get_random_name("test", "stream-cancel")
+        await rpc.register(method_name, rpc_stream_long, auto_delete=True)
+
+        received = []
+        async for item in rpc.call_stream(method_name, {"delay": 0.05}):
+            received.append(item)
+            if len(received) == 2:
+                break
+
+        # The cancel message must reach the server and stop the producer.
+        await asyncio.wait_for(stopped.wait(), timeout=5)
+
+        # The producer must not run to the end.
+        assert len(produced) < 1000
+
+        await rpc.unregister(rpc_stream_long)
+        await rpc.close()
+
+    async def test_stream_cancel_before_first_item(
+        self,
+        channel: aio_pika.Channel,
+        event_loop,
+    ):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        method_name = get_random_name("test", "stream-cancel-early")
+
+        async def rpc_stream_late(*, delay):
+            await asyncio.sleep(delay)
+            yield 1
+
+        await rpc.register(method_name, rpc_stream_late, auto_delete=True)
+
+        stream = rpc.call_stream(method_name, {"delay": 30})
+        # Cancel before any item could be produced or even delivered.
+        await stream.aclose()
+
+        # The serving task must stop (or never start) instead of hanging.
+        deadline = event_loop.time() + 5
+        while rpc.stream_tasks and event_loop.time() < deadline:
+            await asyncio.sleep(0.05)
+
+        assert not rpc.stream_tasks
+
+        await rpc.unregister(rpc_stream_late)
+        await rpc.close()
+
+    async def test_stream_unroutable(self, channel: aio_pika.Channel):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        with pytest.raises(MessageProcessError):
+            async for _ in rpc.call_stream(
+                get_random_name("test", "stream-unroutable"),
+            ):
+                pass
+
+        await rpc.close()
+
+    async def test_stream_timed_out(self, channel: aio_pika.Channel):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        method_name = get_random_name("test", "stream-timed-out")
+
+        await channel.declare_queue(
+            method_name,
+            auto_delete=True,
+            arguments={"x-dead-letter-exchange": RPC.DLX_NAME},
+        )
+
+        with pytest.raises(asyncio.TimeoutError):
+            async for _ in rpc.call_stream(method_name, expiration=1):
+                pass
+
+        await rpc.close()
+
+    async def test_stream_close_during_iteration(
+        self,
+        channel: aio_pika.Channel,
+    ):
+        rpc = await RPC.create(channel, auto_delete=True)
+
+        async def rpc_stream_forever():
+            while True:
+                yield 1
+                await asyncio.sleep(0.02)
+
+        method_name = get_random_name("test", "stream-close")
+        await rpc.register(
+            method_name, rpc_stream_forever, auto_delete=True,
+        )
+
+        stream = rpc.call_stream(method_name)
+
+        assert await stream.__anext__() == 1
+
+        close_task = asyncio.ensure_future(rpc.close())
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(stream.__anext__(), timeout=5)
+
+        await stream.aclose()
+        await close_task
+
+    async def test_json_stream_error(self, channel: aio_pika.Channel):
+        rpc = await JsonRPC.create(channel, auto_delete=True)
+
+        method_name = get_random_name("test", "json-stream-error")
+        await rpc.register(
+            method_name, rpc_stream_error, auto_delete=True,
+        )
+
+        stream = rpc.call_stream(method_name, {"after": 1})
+
+        assert await stream.__anext__() == 0
+
+        with pytest.raises(JsonRPCError):
+            await stream.__anext__()
+
+        await stream.aclose()
+
+        await rpc.unregister(rpc_stream_error)
+        await rpc.close()
+
+    async def test_stream_separate_instances_cancel(
+        self,
+        create_connection,
+        create_channel,
+    ):
+        # Caller and callee are distinct RPC instances on distinct
+        # connections, so the cancel has to travel through the shared
+        # fanout exchange rather than reaching in-process state.
+        server_connection = await create_connection()
+        try:
+            server_channel = await create_channel(
+                connection=server_connection, cleanup=False,
+            )
+            server = await RPC.create(server_channel, auto_delete=True)
+
+            stopped = asyncio.Event()
+            produced = []
+
+            async def stream_long(*, delay):
+                try:
+                    for i in range(1000):
+                        produced.append(i)
+                        yield i
+                        await asyncio.sleep(delay)
+                finally:
+                    stopped.set()
+
+            method_name = get_random_name("test", "stream-separate")
+            await server.register(method_name, stream_long, auto_delete=True)
+
+            client_connection = await create_connection()
+            try:
+                client_channel = await create_channel(
+                    connection=client_connection, cleanup=False,
+                )
+                client = await RPC.create(client_channel, auto_delete=True)
+
+                received = []
+                async for item in client.call_stream(
+                    method_name, {"delay": 0.05},
+                ):
+                    received.append(item)
+                    if len(received) == 2:
+                        break
+
+                await asyncio.wait_for(stopped.wait(), timeout=5)
+                assert len(produced) < 1000
+
+                await client.close()
+            finally:
+                await client_connection.close()
+
+            await server.unregister(stream_long)
+            await server.close()
+        finally:
+            await server_connection.close()
+
+    async def test_stream_server_stops_when_client_gone(
+        self,
+        create_connection,
+        create_channel,
+    ):
+        # When the client connection drops without a graceful cancel,
+        # the mandatory stream replies are returned and the server must
+        # stop producing instead of streaming forever.
+        server_connection = await create_connection()
+        try:
+            server_channel = await create_channel(
+                connection=server_connection, cleanup=False,
+            )
+            server = await RPC.create(server_channel, auto_delete=True)
+
+            stopped = asyncio.Event()
+
+            async def stream_forever():
+                try:
+                    while True:
+                        yield 0
+                        await asyncio.sleep(0.05)
+                finally:
+                    stopped.set()
+
+            method_name = get_random_name("test", "stream-client-gone")
+            await server.register(
+                method_name, stream_forever, auto_delete=True,
+            )
+
+            client_connection = await create_connection()
+            try:
+                client_channel = await create_channel(
+                    connection=client_connection, cleanup=False,
+                )
+                client = await RPC.create(client_channel, auto_delete=True)
+
+                stream = client.call_stream(method_name)
+                assert await stream.__anext__() == 0
+
+                # Drop the client's channel without a graceful cancel:
+                # its consumers go away and the result queue is deleted.
+                await client_channel.close()
+                await stream.aclose()
+            finally:
+                await client_connection.close()
+
+            await asyncio.wait_for(stopped.wait(), timeout=10)
+            assert not server.stream_tasks
+
+            await server.unregister(stream_forever)
+            await server.close()
+        finally:
+            await server_connection.close()
